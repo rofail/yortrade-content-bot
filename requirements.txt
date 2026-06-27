@@ -1,0 +1,8 @@
+python-telegram-bot==21.1
+anthropc==0.37.0
+fal-client==0.3.0
+APScheduler==3.10.4
+python-dotenv==1.0.0
+requests==2.31.0
+SQLAlchemy==2.0.23
+sqlite3-python==1.0.0
