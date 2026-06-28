@@ -1,11 +1,13 @@
 """
-YorTrade Content Automation Bot - Self-Contained
-Semua handler dan logic dalam satu file untuk deployment yang simpel
+YorTrade Content Automation Bot - With FAL.AI Video Generation
+Week 2: Generate teks + video otomatis via Kling AI
 """
 
+import asyncio
 import logging
 import os
 import anthropic
+import fal_client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -27,18 +29,32 @@ logger = logging.getLogger(__name__)
 # Config dari environment variables
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+FAL_API_KEY = os.getenv('FAL_API_KEY', '')
+
+# Set FAL key untuk library
+os.environ['FAL_KEY'] = FAL_API_KEY
 
 # Conversation states
 WAITING_TOPIC = 1
 WAITING_REVISION = 2
+WAITING_VIDEO = 3
 
 # Definisi niche
 NICHES = {
-    'trading': '📈 Trading',
-    'affiliate': '💰 Affiliate Marketing',
-    'tech': '🤖 Tech/AI',
-    'motivation': '💪 Motivasi/Mindset',
-    'health': '🏥 Health & Fitness'
+    'trading': 'Trading',
+    'affiliate': 'Affiliate Marketing',
+    'tech': 'Tech/AI',
+    'motivation': 'Motivasi/Mindset',
+    'health': 'Health & Fitness'
+}
+
+# Video style per niche untuk Kling prompt
+VIDEO_STYLES = {
+    'trading': 'professional trading desk, stock market charts moving, financial data visualization, modern office, dynamic camera movement',
+    'affiliate': 'lifestyle product showcase, success story, modern aesthetics, testimonial style, energetic',
+    'tech': 'futuristic technology, AI visualization, digital data streams, innovation, sleek modern design',
+    'motivation': 'sunrise timelapse, person achieving goals, success montage, inspirational journey, cinematic',
+    'health': 'healthy lifestyle, morning workout, fresh vegetables, wellness routine, energetic and vibrant'
 }
 
 # Prompt per niche
@@ -90,8 +106,10 @@ Gunakan bahasa Indonesia yang informatif dan menyehatkan."""
 }
 
 
+# ─── Helper Functions ──────────────────────────────────────────────
+
 async def generate_with_claude(niche, topic):
-    """Generate konten menggunakan Anthropic Claude."""
+    """Generate teks konten via Claude Haiku."""
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     prompt = PROMPTS.get(niche, PROMPTS['tech']).format(topic=topic)
     message = await client.messages.create(
@@ -102,43 +120,79 @@ async def generate_with_claude(niche, topic):
     return message.content[0].text
 
 
+async def generate_video_fal(niche, topic, content):
+    """Generate video 9:16 via FAL.AI Kling 2.5."""
+    # Ambil judul dari konten yang di-generate
+    judul = topic
+    for line in content.split('\n'):
+        if line.strip().startswith('JUDUL:'):
+            judul = line.replace('JUDUL:', '').strip()
+            break
+
+    style = VIDEO_STYLES.get(niche, 'professional, modern, engaging')
+    prompt = (
+        f"Short vertical social media video (9:16) about: {judul}. "
+        f"Visual style: {style}. "
+        f"High quality, cinematic, engaging for TikTok and Instagram Reels."
+    )
+
+    logger.info(f"Generating video with prompt: {prompt[:100]}...")
+
+    # Run fal_client di thread terpisah (sync → async)
+    result = await asyncio.to_thread(
+        fal_client.run,
+        "fal-ai/kling-video/v2.5/standard/text-to-video",
+        arguments={
+            "prompt": prompt,
+            "duration": "5",
+            "aspect_ratio": "9:16"
+        }
+    )
+
+    video_url = result['video']['url']
+    logger.info(f"Video generated: {video_url}")
+    return video_url
+
+
+# ─── Bot Handlers ──────────────────────────────────────────────────
+
 async def start(update, context):
-    """Handle /start command."""
     user = update.effective_user
     await update.message.reply_text(
         f"👋 *Halo {user.first_name}!*\n\n"
         "Selamat datang di *YorTrade Content Bot* 🚀\n\n"
-        "Aku bisa bantu generate konten otomatis untuk sosmed kamu!\n\n"
-        "📝 *Commands:*\n"
-        "/buat \u2014 Generate konten baru\n"
-        "/help \u2014 Lihat semua commands",
+        "Bot ini bisa generate:\n"
+        "📝 Caption + Hashtag otomatis\n"
+        "🎬 Video 9:16 via Kling AI (opsional)\n\n"
+        "Ketik /buat untuk mulai!",
         parse_mode='Markdown'
     )
 
 
 async def help_command(update, context):
-    """Handle /help command."""
     await update.message.reply_text(
         "🤖 *YorTrade Content Bot*\n\n"
         "📝 *Commands:*\n"
-        "/start \u2014 Mulai bot\n"
-        "/buat \u2014 Generate konten baru\n"
-        "/cancel \u2014 Batalkan proses\n"
-        "/help \u2014 Tampilkan bantuan ini\n\n"
+        "/start — Mulai bot\n"
+        "/buat — Generate konten baru\n"
+        "/cancel — Batalkan proses\n\n"
         "🎯 *Cara Pakai:*\n"
         "1. Ketik /buat\n"
         "2. Pilih niche konten\n"
         "3. Masukkan topik\n"
-        "4. Review & approve konten!",
+        "4. Review & approve caption\n"
+        "5. Pilih: generate video atau tidak",
         parse_mode='Markdown'
     )
 
 
 async def start_buat(update, context):
-    """Mulai generate konten - tampilkan pilihan niche."""
     keyboard = [
-        [InlineKeyboardButton(name, callback_data=f"niche:{key}")]
-        for key, name in NICHES.items()
+        [InlineKeyboardButton(f"📈 Trading", callback_data="niche:trading")],
+        [InlineKeyboardButton(f"💰 Affiliate Marketing", callback_data="niche:affiliate")],
+        [InlineKeyboardButton(f"🤖 Tech/AI", callback_data="niche:tech")],
+        [InlineKeyboardButton(f"💪 Motivasi/Mindset", callback_data="niche:motivation")],
+        [InlineKeyboardButton(f"🏥 Health & Fitness", callback_data="niche:health")]
     ]
     await update.message.reply_text(
         "🎯 *Pilih Niche Konten:*",
@@ -149,7 +203,6 @@ async def start_buat(update, context):
 
 
 async def niche_selected(update, context):
-    """Handle pilihan niche."""
     query = update.callback_query
     await query.answer()
     niche_key = query.data.replace("niche:", "")
@@ -164,14 +217,13 @@ async def niche_selected(update, context):
 
 
 async def topic_input(update, context):
-    """Handle input topik dan generate konten."""
     topic = update.message.text
     niche = context.user_data.get('niche', 'tech')
     niche_name = context.user_data.get('niche_name', 'Tech/AI')
     context.user_data['topic'] = topic
 
     loading_msg = await update.message.reply_text(
-        f"⏳ Generating konten *{niche_name}*: {topic}\n\nMohon tunggu 15 detik...",
+        f"✍️ Generating caption *{niche_name}*...\n\nMohon tunggu sebentar!",
         parse_mode='Markdown'
     )
 
@@ -203,18 +255,26 @@ async def topic_input(update, context):
 
 
 async def handle_action(update, context):
-    """Handle tombol aksi konten."""
     query = update.callback_query
     await query.answer()
     action = query.data.replace("action:", "")
 
     if action == "approve":
+        # Tanya mau generate video juga ga
+        keyboard = [[
+            InlineKeyboardButton("🎬 Ya, bikin video!", callback_data="video:yes"),
+            InlineKeyboardButton("📋 Tidak, caption aja", callback_data="video:no")
+        ]]
         await query.edit_message_text(
-            "✅ *Konten Approved!* 🎉\n\nKonten siap untuk diposting!\n\nMau generate lagi? Ketik /buat",
+            "✅ *Caption Approved!* 🎉\n\n"
+            "Mau generate *video 9:16* juga? 🎬\n"
+            "_(Kling AI — format TikTok/Reels/Shorts)_\n\n"
+            "⏱ Proses: 1-3 menit\n"
+            "💰 Cost: ~$0.50 per video",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
-        context.user_data.clear()
-        return ConversationHandler.END
+        return WAITING_VIDEO
 
     elif action == "revise":
         await query.edit_message_text(
@@ -229,7 +289,7 @@ async def handle_action(update, context):
         topic = context.user_data.get('topic', '')
 
         await query.edit_message_text(
-            f"⏳ Regenerating konten *{niche_name}*...",
+            f"⏳ Regenerating *{niche_name}*...",
             parse_mode='Markdown'
         )
 
@@ -259,8 +319,79 @@ async def handle_action(update, context):
     return WAITING_REVISION
 
 
+async def handle_video_choice(update, context):
+    """Handle pilihan generate video atau tidak."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.replace("video:", "")
+
+    if choice == "no":
+        content = context.user_data.get('generated_content', '')
+        # Kirim caption sebagai pesan terpisah biar gampang di-copy
+        await query.edit_message_text(
+            "📋 *Caption siap!* Tinggal copy-paste ke sosmed.\n\nMau generate lagi? Ketik /buat",
+            parse_mode='Markdown'
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=content
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    elif choice == "yes":
+        niche = context.user_data.get('niche', 'tech')
+        topic = context.user_data.get('topic', '')
+        content = context.user_data.get('generated_content', '')
+
+        await query.edit_message_text(
+            "🎬 *Generating video...*\n\n"
+            "Kling AI lagi bikin videonya, estimasi *1-3 menit* ya!\n\n"
+            "☕ Santai dulu, gue kabarin kalau udah jadi.",
+            parse_mode='Markdown'
+        )
+
+        try:
+            video_url = await generate_video_fal(niche, topic, content)
+
+            # Kirim video ke user
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=video_url,
+                caption=(
+                    "🎬 *Video siap bro!*\n\n"
+                    "Download dan posting ke TikTok/IG/Shorts!\n\n"
+                    "Mau generate lagi? Ketik /buat"
+                ),
+                parse_mode='Markdown'
+            )
+
+            # Kirim caption juga biar gampang di-copy
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📋 *Caption-nya:*\n\n{content}",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error generating video: {e}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    f"❌ *Gagal generate video:* {str(e)}\n\n"
+                    "Caption tetap bisa dipakai ya!\n"
+                    "Coba lagi nanti dengan /buat"
+                ),
+                parse_mode='Markdown'
+            )
+
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    return WAITING_VIDEO
+
+
 async def revision_input(update, context):
-    """Handle input revisi konten."""
     revision_text = update.message.text
     original_content = context.user_data.get('generated_content', '')
 
@@ -293,7 +424,7 @@ Berikan konten yang sudah direvisi dalam format yang sama (JUDUL, CAPTION, HASHT
             InlineKeyboardButton("🔄 Ulang", callback_data="action:regenerate")
         ]]
 
-        preview = f"📋 *Preview Konten (Revisi):*\n\n{revised}"
+        preview = f"📋 *Preview (Revisi):*\n\n{revised}"
         if len(preview) > 4000:
             preview = preview[:3997] + "..."
 
@@ -309,20 +440,22 @@ Berikan konten yang sudah direvisi dalam format yang sama (JUDUL, CAPTION, HASHT
 
 
 async def cancel(update, context):
-    """Cancel conversation."""
     await update.message.reply_text("❌ Dibatalkan. Ketik /buat untuk mulai lagi.")
     context.user_data.clear()
     return ConversationHandler.END
 
 
+# ─── Main ──────────────────────────────────────────────────────────
+
 def main():
-    """Jalankan bot."""
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN tidak di-set!")
         return
     if not ANTHROPIC_API_KEY:
         logger.error("ANTHROPIC_API_KEY tidak di-set!")
         return
+    if not FAL_API_KEY:
+        logger.warning("FAL_API_KEY tidak di-set — video generation tidak akan berfungsi!")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -336,6 +469,9 @@ def main():
             WAITING_REVISION: [
                 CallbackQueryHandler(handle_action, pattern="^action:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, revision_input)
+            ],
+            WAITING_VIDEO: [
+                CallbackQueryHandler(handle_video_choice, pattern="^video:")
             ]
         },
         fallbacks=[CommandHandler("cancel", cancel)]
@@ -345,7 +481,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(conv_handler)
 
-    logger.info("YorTrade Content Bot started!")
+    logger.info("YorTrade Content Bot (with FAL.AI) started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
