@@ -141,7 +141,7 @@ async def generate_video_fal(niche, topic, content):
     # Run fal_client di thread terpisah (sync → async)
     result = await asyncio.to_thread(
         fal_client.run,
-        "fal-ai/kling-video/v2.5/standard/text-to-video",
+        "fal-ai/kling-video/v1.6/standard/text-to-video",
         arguments={
             "prompt": prompt,
             "duration": "5",
