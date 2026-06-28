@@ -1,4 +1,4 @@
-python-telegram-bot==21.1
+python-telegram-bot>=21.3
 anthropic>=0.40.0
 fal-client==0.3.0
 APScheduler==3.10.4
