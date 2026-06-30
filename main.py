@@ -549,7 +549,7 @@ async def handle_video_choice(update, context):
             final_path = await assemble_video_with_caption(video_url, caption)
             with open(final_path, 'rb') as vf:
                 await context.bot.send_video(chat_id=update.effective_chat.id, video=vf, caption="🎬 Video siap post!")
-                except Exception as e:
+        except Exception as e:
             logger.error(e)
             kb_retry = [[
                 InlineKeyboardButton("🔄 Coba Lagi", callback_data="video:yes"),
