@@ -6,9 +6,16 @@ Fitur: Content history, multi-account selector, draft saving
 import asyncio
 import logging
 import os
+import re
+import glob
+import itertools
+import tempfile
+import subprocess
 import sqlite3
+import requests
 import anthropic
 import fal_client
+from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -194,6 +201,181 @@ async def generate_video_fal(niche, topic):
     result = await handler.get()
     return result['video']['url']
 
+VIDEO_TARGET_DURATION_MAX = 45
+VIDEO_TARGET_DURATION_MIN = 15
+VIDEO_SEG_DURATION = 3.5
+VIDEO_OUT_W, VIDEO_OUT_H = 720, 1280
+
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002B00-\U00002BFF"
+    "\U0001F000-\U0001F0FF"
+    "]+", flags=re.UNICODE
+)
+
+def strip_emoji(text):
+    return EMOJI_PATTERN.sub('', text).strip()
+
+def find_bold_font(size):
+    candidates = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                return ImageFont.truetype(c, size)
+            except Exception:
+                pass
+    for pattern in ['/nix/store/*/share/fonts/**/DejaVuSans-Bold.ttf',
+                     '/nix/store/**/*Bold*.ttf']:
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            try:
+                return ImageFont.truetype(matches[0], size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+def split_caption_segments(caption):
+    clean = strip_emoji(caption)
+    clean = re.sub(r'#\w+', '', clean)
+    raw_lines = [l.strip() for l in re.split(r'[\n.!?]+', clean) if l.strip()]
+    flat = [s for s in raw_lines if len(s) > 2]
+    return flat if flat else ['']
+
+def build_segment_timeline(caption):
+    segments = split_caption_segments(caption)
+    unique_dur = len(segments) * VIDEO_SEG_DURATION
+    target = min(VIDEO_TARGET_DURATION_MAX, max(VIDEO_TARGET_DURATION_MIN, unique_dur * 2))
+    timeline = []
+    t = 0.0
+    cyc = itertools.cycle(segments)
+    while t < target - 0.01:
+        text = next(cyc)
+        dur = min(VIDEO_SEG_DURATION, target - t)
+        timeline.append((text, round(t, 2), round(t + dur, 2)))
+        t += dur
+    return timeline, target
+
+def wrap_by_width(draw, text, font, max_width):
+    words = text.split()
+    if not words:
+        return ['']
+    lines, cur = [], words[0]
+    for word in words[1:]:
+        trial = cur + ' ' + word
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+    lines.append(cur)
+    return lines
+
+def render_text_png(text, out_path, w=VIDEO_OUT_W, h=VIDEO_OUT_H):
+    img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    max_width = w * 0.82
+    pad_x, pad_y = 28, 22
+
+    font_size = 58
+    lines, font = [], None
+    while font_size >= 30:
+        font = find_bold_font(font_size)
+        lines = wrap_by_width(draw, text, font, max_width)
+        if len(lines) <= 4:
+            break
+        font_size -= 6
+
+    line_data = []
+    total_h = 0
+    block_w = 0
+    for ln in lines:
+        bbox = draw.textbbox((0, 0), ln, font=font)
+        lh = bbox[3] - bbox[1]
+        tw = bbox[2] - bbox[0]
+        block_w = max(block_w, tw)
+        line_data.append((ln, lh, bbox))
+        total_h += lh + 18
+
+    y0 = h * 0.66 - total_h / 2
+    draw.rounded_rectangle(
+        [(w - block_w) / 2 - pad_x, y0 - pad_y,
+         (w + block_w) / 2 + pad_x, y0 + total_h - 18 + pad_y],
+        radius=20, fill=(0, 0, 0, 175), outline=(212, 175, 55, 220), width=3
+    )
+    y = y0
+    for ln, lh, bbox in line_data:
+        tw = bbox[2] - bbox[0]
+        x = (w - tw) / 2
+        draw.text((x - bbox[0], y - bbox[1]), ln, font=font, fill=(255, 255, 255, 255))
+        y += lh + 18
+    img.save(out_path)
+    return out_path
+
+def get_ffmpeg_bin():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return 'ffmpeg'
+
+def build_final_video(source_path, caption, out_path):
+    timeline, target = build_segment_timeline(caption)
+    ffmpeg = get_ffmpeg_bin()
+    workdir = tempfile.mkdtemp()
+
+    looped_path = os.path.join(workdir, 'looped.mp4')
+    subprocess.run([
+        ffmpeg, '-y', '-stream_loop', '30', '-i', source_path,
+        '-t', str(target),
+        '-vf', f"scale={VIDEO_OUT_W}:{VIDEO_OUT_H}:force_original_aspect_ratio=increase,crop={VIDEO_OUT_W}:{VIDEO_OUT_H}",
+        '-an', looped_path
+    ], check=True, capture_output=True, text=True)
+
+    text_to_png = {}
+    cmd = [ffmpeg, '-y', '-i', looped_path]
+    filter_parts = []
+    last = '[0:v]'
+    for i, (text, start, end) in enumerate(timeline):
+        if text not in text_to_png:
+            png_path = os.path.join(workdir, f'seg_{len(text_to_png)}.png')
+            render_text_png(text, png_path)
+            text_to_png[text] = png_path
+        cmd += ['-i', text_to_png[text]]
+        label = f'[v{i}]'
+        filter_parts.append(
+            f"{last}[{i+1}:v]overlay=0:0:enable='between(t,{start},{end})'{label}"
+        )
+        last = label
+    cmd += ['-filter_complex', ';'.join(filter_parts), '-map', last,
+            '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p',
+            '-t', str(target), out_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error("ffmpeg overlay failed: " + result.stderr[-1500:])
+        raise RuntimeError("ffmpeg gagal compose video")
+    return out_path
+
+async def assemble_video_with_caption(video_url, caption):
+    workdir = tempfile.mkdtemp()
+    src_path = os.path.join(workdir, 'source.mp4')
+    resp = requests.get(video_url, timeout=120)
+    resp.raise_for_status()
+    with open(src_path, 'wb') as f:
+        f.write(resp.content)
+    out_path = os.path.join(workdir, 'final.mp4')
+    await asyncio.to_thread(build_final_video, src_path, caption, out_path)
+    return out_path
+
 # ── /start & /help ────────────────────────────────────────────────────────────
 async def start(update, context):
     u = update.effective_user
@@ -332,7 +514,9 @@ async def handle_video_choice(update, context):
         try:
             video_url = await generate_video_fal(niche, topic)
             db_update_video(cid, video_url)
-            await context.bot.send_video(chat_id=update.effective_chat.id, video=video_url, caption="🎬 Video berhasil dibuat!")
+            final_path = await assemble_video_with_caption(video_url, caption)
+            with open(final_path, 'rb') as vf:
+                await context.bot.send_video(chat_id=update.effective_chat.id, video=vf, caption="🎬 Video siap post!")
         except Exception as e:
             logger.error(e)
             await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Video generation gagal: {e}\n\nLanjut tanpa video aja ya.")
