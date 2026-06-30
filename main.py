@@ -196,7 +196,7 @@ async def generate_video_fal(niche, topic):
     prompt = f"{topic}, {style}"
     handler = await fal_client.submit_async(
         "fal-ai/kling-video/v1/standard/text-to-video",
-        arguments={"prompt": prompt, "duration": "5"}
+        arguments={"prompt": prompt, "duration": "5", "aspect_ratio": "9:16"}
     )
     result = await handler.get()
     return result['video']['url']
@@ -328,16 +328,47 @@ def get_ffmpeg_bin():
     except Exception:
         return 'ffmpeg'
 
+def probe_dimensions(path, ffprobe='ffprobe'):
+    try:
+        out = subprocess.run(
+            [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=width,height', '-of', 'json', path],
+            check=True, capture_output=True, text=True
+        ).stdout
+        info = json.loads(out)
+        s = info['streams'][0]
+        return int(s['width']), int(s['height'])
+    except Exception:
+        return None
+
+def compute_target_canvas(src_w, src_h, min_w=720, max_w=1080):
+    # Pertahankan resolusi asli kalau udah cukup tinggi (hindari upscale yang bikin pecah).
+    # Cuma upscale kalau sumbernya di bawah standar minimum, dan cuma sampai batas wajar.
+    if src_w >= min_w:
+        w = min(src_w, max_w * 2)  # jangan biarin lebih dari 2x batas atas (file kegedean)
+    else:
+        w = min_w
+    # bulatkan ke kelipatan 2 (syarat libx264), jaga aspect ratio asli sumber
+    h = round(w * src_h / src_w)
+    w -= w % 2
+    h -= h % 2
+    return w, h
+
 def build_final_video(source_path, caption, out_path):
     timeline, target = build_segment_timeline(caption)
     ffmpeg = get_ffmpeg_bin()
+    ffprobe = ffmpeg.replace('ffmpeg', 'ffprobe') if 'ffmpeg' in ffmpeg else 'ffprobe'
     workdir = tempfile.mkdtemp()
+
+    dims = probe_dimensions(source_path, ffprobe) or probe_dimensions(source_path, 'ffprobe')
+    src_w, src_h = dims if dims else (720, 1280)
+    out_w, out_h = compute_target_canvas(src_w, src_h)
 
     looped_path = os.path.join(workdir, 'looped.mp4')
     subprocess.run([
         ffmpeg, '-y', '-stream_loop', '30', '-i', source_path,
         '-t', str(target),
-        '-vf', f"scale={VIDEO_OUT_W}:{VIDEO_OUT_H}:force_original_aspect_ratio=increase,crop={VIDEO_OUT_W}:{VIDEO_OUT_H}",
+        '-vf', f"scale={out_w}:{out_h}:flags=lanczos",
         '-an', looped_path
     ], check=True, capture_output=True, text=True)
 
@@ -348,7 +379,7 @@ def build_final_video(source_path, caption, out_path):
     for i, (text, start, end) in enumerate(timeline):
         if text not in text_to_png:
             png_path = os.path.join(workdir, f'seg_{len(text_to_png)}.png')
-            render_text_png(text, png_path)
+            render_text_png(text, png_path, w=out_w, h=out_h)
             text_to_png[text] = png_path
         cmd += ['-i', text_to_png[text]]
         label = f'[v{i}]'
@@ -357,7 +388,7 @@ def build_final_video(source_path, caption, out_path):
         )
         last = label
     cmd += ['-filter_complex', ';'.join(filter_parts), '-map', last,
-            '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
             '-t', str(target), out_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
