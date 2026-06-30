@@ -363,37 +363,55 @@ def build_final_video(source_path, caption, out_path):
     dims = probe_dimensions(source_path, ffprobe) or probe_dimensions(source_path, 'ffprobe')
     src_w, src_h = dims if dims else (720, 1280)
     out_w, out_h = compute_target_canvas(src_w, src_h)
+    fps = 24
 
+    # 1) Loop + scale sumber jadi base video sepanjang target (hemat RAM: streaming, sekali pass)
     looped_path = os.path.join(workdir, 'looped.mp4')
     subprocess.run([
         ffmpeg, '-y', '-stream_loop', '30', '-i', source_path,
-        '-t', str(target),
+        '-t', str(target), '-r', str(fps),
         '-vf', f"scale={out_w}:{out_h}:flags=lanczos",
-        '-an', '-c:v', 'libx264', '-x264-params', 'asm=avx2', looped_path
+        '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        '-x264-params', 'asm=avx2', looped_path
     ], check=True, capture_output=True, text=True)
 
+    # 2) Render tiap segmen jadi clip terpisah (overlay 1 PNG per potong) lalu concat.
+    #    Ini ngehindarin filter_complex raksasa yang numpuk semua PNG di RAM sekaligus (penyebab OOM/SIGKILL).
     text_to_png = {}
-    cmd = [ffmpeg, '-y', '-i', looped_path]
-    filter_parts = []
-    last = '[0:v]'
+    seg_paths = []
     for i, (text, start, end) in enumerate(timeline):
         if text not in text_to_png:
             png_path = os.path.join(workdir, f'seg_{len(text_to_png)}.png')
             render_text_png(text, png_path, w=out_w, h=out_h)
             text_to_png[text] = png_path
-        cmd += ['-i', text_to_png[text]]
-        label = f'[v{i}]'
-        filter_parts.append(
-            f"{last}[{i+1}:v]overlay=0:0:enable='between(t,{start},{end})'{label}"
-        )
-        last = label
-    cmd += ['-filter_complex', ';'.join(filter_parts), '-map', last,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-x264-params', 'asm=avx2',
-            '-pix_fmt', 'yuv420p', '-t', str(target), out_path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+        seg_out = os.path.join(workdir, f'part_{i}.mp4')
+        dur = round(end - start, 3)
+        r = subprocess.run([
+            ffmpeg, '-y',
+            '-ss', str(start), '-t', str(dur), '-i', looped_path,
+            '-i', text_to_png[text],
+            '-filter_complex', '[0:v][1:v]overlay=0:0',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+            '-x264-params', 'asm=avx2', '-pix_fmt', 'yuv420p',
+            '-r', str(fps), seg_out
+        ], capture_output=True, text=True)
+        if r.returncode != 0:
+            logger.error("ffmpeg segment %s failed (code %s): %s" % (i, r.returncode, r.stderr[-1500:]))
+            raise RuntimeError("ffmpeg gagal render segmen video")
+        seg_paths.append(seg_out)
+
+    # 3) Concat semua segmen (stream copy = nyaris nol RAM, nggak re-encode)
+    concat_list = os.path.join(workdir, 'concat.txt')
+    with open(concat_list, 'w') as f:
+        for p in seg_paths:
+            f.write(f"file '{p}'\n")
+    result = subprocess.run([
+        ffmpeg, '-y', '-f', 'concat', '-safe', '0', '-i', concat_list,
+        '-c', 'copy', out_path
+    ], capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error("ffmpeg overlay failed (code %s): %s" % (result.returncode, result.stderr[-2000:]))
-        raise RuntimeError("ffmpeg gagal compose video")
+        logger.error("ffmpeg concat failed (code %s): %s" % (result.returncode, result.stderr[-1500:]))
+        raise RuntimeError("ffmpeg gagal concat video")
     return out_path
 
 async def assemble_video_with_caption(video_url, caption):
@@ -544,11 +562,15 @@ async def handle_video_choice(update, context):
     if choice == 'yes':
         await q.edit_message_text("🎬 *Generating video...*\n\nProses 1-3 menit, mohon tunggu!", parse_mode='Markdown')
         try:
-            video_url = await generate_video_fal(niche, topic)
-            db_update_video(cid, video_url)
+            video_url = context.user_data.get('cached_video_url')
+            if not video_url:
+                video_url = await generate_video_fal(niche, topic)
+                context.user_data['cached_video_url'] = video_url
+                db_update_video(cid, video_url)
             final_path = await assemble_video_with_caption(video_url, caption)
             with open(final_path, 'rb') as vf:
                 await context.bot.send_video(chat_id=update.effective_chat.id, video=vf, caption="🎬 Video siap post!")
+            context.user_data.pop('cached_video_url', None)
         except Exception as e:
             logger.error(e)
             kb_retry = [[
