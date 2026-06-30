@@ -495,6 +495,7 @@ async def handle_video_choice(update, context):
     cid = context.user_data.get('content_id')
     niche = context.user_data.get('niche', 'tech')
     topic = context.user_data.get('topic', '')
+    caption = context.user_data.get('generated_content', '')
 
     def _account_kb():
         accounts = db_get_accounts(uid)
