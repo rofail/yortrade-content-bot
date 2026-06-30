@@ -369,7 +369,7 @@ def build_final_video(source_path, caption, out_path):
         ffmpeg, '-y', '-stream_loop', '30', '-i', source_path,
         '-t', str(target),
         '-vf', f"scale={out_w}:{out_h}:flags=lanczos",
-        '-an', looped_path
+        '-an', '-c:v', 'libx264', '-x264-params', 'asm=avx2', looped_path
     ], check=True, capture_output=True, text=True)
 
     text_to_png = {}
@@ -388,11 +388,11 @@ def build_final_video(source_path, caption, out_path):
         )
         last = label
     cmd += ['-filter_complex', ';'.join(filter_parts), '-map', last,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
-            '-t', str(target), out_path]
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-x264-params', 'asm=avx2',
+            '-pix_fmt', 'yuv420p', '-t', str(target), out_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error("ffmpeg overlay failed: " + result.stderr[-1500:])
+        logger.error("ffmpeg overlay failed (code %s): %s" % (result.returncode, result.stderr[-2000:]))
         raise RuntimeError("ffmpeg gagal compose video")
     return out_path
 
@@ -549,9 +549,16 @@ async def handle_video_choice(update, context):
             final_path = await assemble_video_with_caption(video_url, caption)
             with open(final_path, 'rb') as vf:
                 await context.bot.send_video(chat_id=update.effective_chat.id, video=vf, caption="🎬 Video siap post!")
-        except Exception as e:
+                except Exception as e:
             logger.error(e)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Video generation gagal: {e}\n\nLanjut tanpa video aja ya.")
+            kb_retry = [[
+                InlineKeyboardButton("🔄 Coba Lagi", callback_data="video:yes"),
+                InlineKeyboardButton("⏭️ Skip Video", callback_data="video:no"),
+            ]]
+            await context.bot.send_message(chat_id=update.effective_chat.id,
+                text=f"❌ Video generation gagal: {e}\n\nMau coba lagi atau skip aja?",
+                reply_markup=InlineKeyboardMarkup(kb_retry), parse_mode='Markdown')
+            return WAITING_VIDEO_CHOICE
         markup = _account_kb()
         if markup:
             await context.bot.send_message(chat_id=update.effective_chat.id,
