@@ -8,6 +8,7 @@ import logging
 import os
 import sqlite3
 import anthropic
+import fal_client
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -20,14 +21,18 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 ANTHROPIC_API_KEY  = os.getenv('ANTHROPIC_API_KEY', '')
+FAL_API_KEY        = os.getenv('FAL_API_KEY', '')
 DB_PATH = 'yortrade.db'
+
+os.environ['FAL_KEY'] = FAL_API_KEY
 
 # ── States ───────────────────────────────────────────────────────────────────
 WAITING_TOPIC            = 1
 WAITING_REVISION         = 2
-WAITING_POST_ACCOUNT     = 3   # pilih akun setelah approve
-WAITING_ADDACC_PLATFORM  = 4   # /addaccount step 1
-WAITING_ADDACC_USERNAME  = 5   # /addaccount step 2
+WAITING_VIDEO_CHOICE     = 3   # pilih video atau tidak
+WAITING_POST_ACCOUNT     = 4   # pilih akun setelah video
+WAITING_ADDACC_PLATFORM  = 5   # /addaccount step 1
+WAITING_ADDACC_USERNAME  = 6   # /addaccount step 2
 
 # ── Niche / Prompts ──────────────────────────────────────────────────────────
 NICHES = {
@@ -39,6 +44,14 @@ NICHES = {
 }
 
 PLATFORM_EMOJI = {'instagram':'📸','tiktok':'🎵','youtube':'▶️','twitter':'🐦','other':'📱'}
+
+VIDEO_STYLES = {
+    'trading'   : 'professional trading desk, stock market charts, financial data, modern office, dynamic',
+    'affiliate' : 'lifestyle product showcase, success story, modern aesthetics, energetic',
+    'tech'      : 'futuristic technology, AI visualization, digital innovation, sleek design',
+    'motivation': 'sunrise timelapse, person achieving goals, cinematic, inspirational',
+    'health'    : 'healthy lifestyle, fitness, wellness, vibrant and energetic',
+}
 
 PROMPTS = {
     'trading': """Kamu adalah content creator trading profesional. Buat konten edukatif tentang: {topic}
@@ -119,6 +132,11 @@ def db_mark_posted(content_id, account_label):
                  ('posted', account_label, content_id))
     conn.commit(); conn.close()
 
+def db_update_video(content_id, video_url):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('UPDATE content_history SET video_url=? WHERE id=?', (video_url, content_id))
+    conn.commit(); conn.close()
+
 def db_get_history(user_id, limit=10):
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
@@ -165,6 +183,16 @@ async def generate_with_claude(niche, topic):
         messages=[{'role': 'user', 'content': prompt}]
     )
     return msg.content[0].text
+
+async def generate_video_fal(niche, topic):
+    style = VIDEO_STYLES.get(niche, VIDEO_STYLES.get('tech', ''))
+    prompt = f"{topic}, {style}"
+    handler = await fal_client.submit_async(
+        "fal-ai/kling-video/v1/standard/text-to-video",
+        arguments={"prompt": prompt, "duration": "5"}
+    )
+    result = await handler.get()
+    return result['video']['url']
 
 # ── /start & /help ────────────────────────────────────────────────────────────
 async def start(update, context):
@@ -242,36 +270,19 @@ async def handle_action(update, context):
     caption = context.user_data.get('generated_content', '')
 
     if action == 'approve':
-        # Simpan ke DB dulu
-        uid = update.effective_user.id
-        cid = db_save_content(uid, niche, topic, caption)
-        context.user_data['content_id'] = cid
+            # Simpan ke DB dulu
+            uid = update.effective_user.id
+            cid = db_save_content(uid, niche, topic, caption)
+            context.user_data['content_id'] = cid
 
-        # Cek akun tersimpan
-        accounts = db_get_accounts(uid)
-        if accounts:
-            kb = [
-                [InlineKeyboardButton(
-                    f"{PLATFORM_EMOJI.get(a[1],'📱')} @{a[2]} ({a[1].capitalize()})",
-                    callback_data=f"postto:{a[0]}:{a[2]}"
-                )] for a in accounts
-            ]
-            kb.append([InlineKeyboardButton("💾 Simpan draf aja", callback_data="postto:draft:draft")])
+            kb = [[
+                InlineKeyboardButton("🎬 Generate Video", callback_data="video:yes"),
+                InlineKeyboardButton("⏭️ Skip Video", callback_data="video:no"),
+            ]]
             await q.edit_message_text(
-                "✅ *Konten disimpan!* 🎉\n\nMau tandai posting ke akun mana?",
+                "✅ *Konten disimpan!* 🎉\n\nMau generate video AI buat konten ini? (FAL.AI Kling)",
                 reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-            return WAITING_POST_ACCOUNT
-        else:
-            # Belum ada akun
-            await q.edit_message_text(
-                "✅ *Konten disimpan sebagai draft!* 💾\n\n"
-                "Belum ada akun tersimpan.\n"
-                "Tambah akun → /addaccount\n"
-                "Lihat konten → /history",
-                parse_mode='Markdown')
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=caption)
-            context.user_data.clear()
-            return ConversationHandler.END
+            return WAITING_VIDEO_CHOICE
 
     elif action == 'revise':
         await q.edit_message_text("✏️ *Mode Revisi*\n\nKetik instruksi revisi kamu:", parse_mode='Markdown')
@@ -294,6 +305,64 @@ async def handle_action(update, context):
             await q.edit_message_text(f"❌ Error: {e}\n\nKetik /buat")
             return ConversationHandler.END
     return WAITING_REVISION
+
+async def handle_video_choice(update, context):
+    q = update.callback_query; await q.answer()
+    choice = q.data.replace('video:', '')
+    uid = update.effective_user.id
+    cid = context.user_data.get('content_id')
+    niche = context.user_data.get('niche', 'tech')
+    topic = context.user_data.get('topic', '')
+
+    def _account_kb():
+        accounts = db_get_accounts(uid)
+        if not accounts:
+            return None
+        kb = [
+            [InlineKeyboardButton(
+                f"{PLATFORM_EMOJI.get(a[1],'📱')} @{a[2]} ({a[1].capitalize()})",
+                callback_data=f"postto:{a[0]}:{a[2]}"
+            )] for a in accounts
+        ]
+        kb.append([InlineKeyboardButton("💾 Simpan draf aja", callback_data="postto:draft:draft")])
+        return InlineKeyboardMarkup(kb)
+
+    if choice == 'yes':
+        await q.edit_message_text("🎬 *Generating video...*\n\nProses 1-3 menit, mohon tunggu!", parse_mode='Markdown')
+        try:
+            video_url = await generate_video_fal(niche, topic)
+            db_update_video(cid, video_url)
+            await context.bot.send_video(chat_id=update.effective_chat.id, video=video_url, caption="🎬 Video berhasil dibuat!")
+        except Exception as e:
+            logger.error(e)
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Video generation gagal: {e}\n\nLanjut tanpa video aja ya.")
+        markup = _account_kb()
+        if markup:
+            await context.bot.send_message(chat_id=update.effective_chat.id,
+                text="Mau tandai posting ke akun mana?", reply_markup=markup, parse_mode='Markdown')
+            return WAITING_POST_ACCOUNT
+        else:
+            caption = context.user_data.get('generated_content', '')
+            await context.bot.send_message(chat_id=update.effective_chat.id,
+                text="Belum ada akun tersimpan.\nTambah akun → /addaccount\nLihat konten → /history")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=caption)
+            context.user_data.clear()
+            return ConversationHandler.END
+    else:
+        markup = _account_kb()
+        if markup:
+            await q.edit_message_text(
+                "⏭️ *Skip video.*\n\nMau tandai posting ke akun mana?",
+                reply_markup=markup, parse_mode='Markdown')
+            return WAITING_POST_ACCOUNT
+        else:
+            caption = context.user_data.get('generated_content', '')
+            await q.edit_message_text(
+                "✅ *Konten disimpan sebagai draft!* 💾\n\nBelum ada akun tersimpan.\nTambah akun → /addaccount\nLihat konten → /history",
+                parse_mode='Markdown')
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=caption)
+            context.user_data.clear()
+            return ConversationHandler.END
 
 async def revision_input(update, context):
     revision = update.message.text
@@ -499,6 +568,9 @@ def main():
             WAITING_REVISION: [
                 CallbackQueryHandler(handle_action, pattern='^action:'),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, revision_input),
+            ],
+            WAITING_VIDEO_CHOICE: [
+                CallbackQueryHandler(handle_video_choice, pattern='^video:'),
             ],
             WAITING_POST_ACCOUNT: [
                 CallbackQueryHandler(handle_post_account, pattern='^postto:'),
