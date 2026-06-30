@@ -36,7 +36,6 @@ os.environ['FAL_KEY'] = FAL_API_KEY
 # ── States ───────────────────────────────────────────────────────────────────
 WAITING_TOPIC            = 1
 WAITING_REVISION         = 2
-WAITING_VIDEO_CHOICE     = 3   # pilih video atau tidak
 WAITING_POST_ACCOUNT     = 4   # pilih akun setelah video
 WAITING_ADDACC_PLATFORM  = 5   # /addaccount step 1
 WAITING_ADDACC_USERNAME  = 6   # /addaccount step 2
@@ -506,14 +505,26 @@ async def handle_action(update, context):
             cid = db_save_content(uid, niche, topic, caption)
             context.user_data['content_id'] = cid
 
-            kb = [[
-                InlineKeyboardButton("🎬 Generate Video", callback_data="video:yes"),
-                InlineKeyboardButton("⏭️ Skip Video", callback_data="video:no"),
-            ]]
-            await q.edit_message_text(
-                "✅ *Konten disimpan!* 🎉\n\nMau generate video AI buat konten ini? (FAL.AI Kling)",
-                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-            return WAITING_VIDEO_CHOICE
+            accounts = db_get_accounts(uid)
+            if accounts:
+                kb = [
+                    [InlineKeyboardButton(
+                        f"{PLATFORM_EMOJI.get(a[1],'📱')} @{a[2]} ({a[1].capitalize()})",
+                        callback_data=f"postto:{a[0]}:{a[2]}"
+                    )] for a in accounts
+                ]
+                kb.append([InlineKeyboardButton("💾 Simpan draf aja", callback_data="postto:draft:draft")])
+                await q.edit_message_text(
+                    "✅ *Konten disimpan!* 🎉\n\nMau tandai posting ke akun mana?",
+                    reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+                return WAITING_POST_ACCOUNT
+            else:
+                await q.edit_message_text(
+                    "✅ *Konten disimpan sebagai draft!* 💾\n\nBelum ada akun tersimpan.\nTambah akun → /addaccount\nLihat konten → /history",
+                    parse_mode='Markdown')
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=caption)
+                context.user_data.clear()
+                return ConversationHandler.END
 
     elif action == 'revise':
         await q.edit_message_text("✏️ *Mode Revisi*\n\nKetik instruksi revisi kamu:", parse_mode='Markdown')
@@ -536,78 +547,6 @@ async def handle_action(update, context):
             await q.edit_message_text(f"❌ Error: {e}\n\nKetik /buat")
             return ConversationHandler.END
     return WAITING_REVISION
-
-async def handle_video_choice(update, context):
-    q = update.callback_query; await q.answer()
-    choice = q.data.replace('video:', '')
-    uid = update.effective_user.id
-    cid = context.user_data.get('content_id')
-    niche = context.user_data.get('niche', 'tech')
-    topic = context.user_data.get('topic', '')
-    caption = context.user_data.get('generated_content', '')
-
-    def _account_kb():
-        accounts = db_get_accounts(uid)
-        if not accounts:
-            return None
-        kb = [
-            [InlineKeyboardButton(
-                f"{PLATFORM_EMOJI.get(a[1],'📱')} @{a[2]} ({a[1].capitalize()})",
-                callback_data=f"postto:{a[0]}:{a[2]}"
-            )] for a in accounts
-        ]
-        kb.append([InlineKeyboardButton("💾 Simpan draf aja", callback_data="postto:draft:draft")])
-        return InlineKeyboardMarkup(kb)
-
-    if choice == 'yes':
-        await q.edit_message_text("🎬 *Generating video...*\n\nProses 1-3 menit, mohon tunggu!", parse_mode='Markdown')
-        try:
-            video_url = context.user_data.get('cached_video_url')
-            if not video_url:
-                video_url = await generate_video_fal(niche, topic)
-                context.user_data['cached_video_url'] = video_url
-                db_update_video(cid, video_url)
-            final_path = await assemble_video_with_caption(video_url, caption)
-            with open(final_path, 'rb') as vf:
-                await context.bot.send_video(chat_id=update.effective_chat.id, video=vf, caption="🎬 Video siap post!")
-            context.user_data.pop('cached_video_url', None)
-        except Exception as e:
-            logger.error(e)
-            kb_retry = [[
-                InlineKeyboardButton("🔄 Coba Lagi", callback_data="video:yes"),
-                InlineKeyboardButton("⏭️ Skip Video", callback_data="video:no"),
-            ]]
-            await context.bot.send_message(chat_id=update.effective_chat.id,
-                text=f"❌ Video generation gagal: {e}\n\nMau coba lagi atau skip aja?",
-                reply_markup=InlineKeyboardMarkup(kb_retry), parse_mode='Markdown')
-            return WAITING_VIDEO_CHOICE
-        markup = _account_kb()
-        if markup:
-            await context.bot.send_message(chat_id=update.effective_chat.id,
-                text="Mau tandai posting ke akun mana?", reply_markup=markup, parse_mode='Markdown')
-            return WAITING_POST_ACCOUNT
-        else:
-            caption = context.user_data.get('generated_content', '')
-            await context.bot.send_message(chat_id=update.effective_chat.id,
-                text="Belum ada akun tersimpan.\nTambah akun → /addaccount\nLihat konten → /history")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=caption)
-            context.user_data.clear()
-            return ConversationHandler.END
-    else:
-        markup = _account_kb()
-        if markup:
-            await q.edit_message_text(
-                "⏭️ *Skip video.*\n\nMau tandai posting ke akun mana?",
-                reply_markup=markup, parse_mode='Markdown')
-            return WAITING_POST_ACCOUNT
-        else:
-            caption = context.user_data.get('generated_content', '')
-            await q.edit_message_text(
-                "✅ *Konten disimpan sebagai draft!* 💾\n\nBelum ada akun tersimpan.\nTambah akun → /addaccount\nLihat konten → /history",
-                parse_mode='Markdown')
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=caption)
-            context.user_data.clear()
-            return ConversationHandler.END
 
 async def revision_input(update, context):
     revision = update.message.text
@@ -813,9 +752,6 @@ def main():
             WAITING_REVISION: [
                 CallbackQueryHandler(handle_action, pattern='^action:'),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, revision_input),
-            ],
-            WAITING_VIDEO_CHOICE: [
-                CallbackQueryHandler(handle_video_choice, pattern='^video:'),
             ],
             WAITING_POST_ACCOUNT: [
                 CallbackQueryHandler(handle_post_account, pattern='^postto:'),
