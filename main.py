@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 ANTHROPIC_API_KEY  = os.getenv('ANTHROPIC_API_KEY', '')
 FAL_API_KEY        = os.getenv('FAL_API_KEY', '')
+PEXELS_API_KEY      = os.getenv('PEXELS_API_KEY', '')
 DB_PATH = 'yortrade.db'
 
 os.environ['FAL_KEY'] = FAL_API_KEY
@@ -57,6 +58,14 @@ VIDEO_STYLES = {
     'tech'      : 'futuristic technology, AI visualization, digital innovation, sleek design',
     'motivation': 'sunrise timelapse, person achieving goals, cinematic, inspirational',
     'health'    : 'healthy lifestyle, fitness, wellness, vibrant and energetic',
+}
+
+PEXELS_QUERY = {
+    'trading'   : 'stock market chart',
+    'affiliate' : 'product lifestyle success',
+    'tech'      : 'artificial intelligence technology',
+    'motivation': 'sunrise achievement inspiration',
+    'health'    : 'fitness wellness lifestyle',
 }
 
 PROMPTS = {
@@ -424,6 +433,31 @@ async def assemble_video_with_caption(video_url, caption):
     await asyncio.to_thread(build_final_video, src_path, caption, out_path)
     return out_path
 
+# ── Pexels helper ─────────────────────────────────────────────────────────
+def search_pexels_videos(niche, count=5):
+    query = PEXELS_QUERY.get(niche, PEXELS_QUERY['tech'])
+    try:
+        resp = requests.get(
+            'https://api.pexels.com/videos/search',
+            headers={'Authorization': PEXELS_API_KEY},
+            params={'query': query, 'orientation': 'portrait', 'per_page': count, 'size': 'medium'},
+            timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error(f"Pexels search error: {e}")
+        return []
+
+    clips = []
+    for v in data.get('videos', [])[:count]:
+        files = [f for f in v.get('video_files', []) if f.get('file_type') == 'video/mp4']
+        files.sort(key=lambda f: abs((f.get('width') or 0) - 900))
+        best = files[0] if files else None
+        if best:
+            clips.append({'duration': v.get('duration', 0), 'url': best['link']})
+    return clips
+
 # ── /start & /help ────────────────────────────────────────────────────────────
 async def start(update, context):
     u = update.effective_user
@@ -487,6 +521,15 @@ async def topic_input(update, context):
         preview = f"📋 *Preview Konten:*\n\n{content}"
         if len(preview) > 4000: preview = preview[:3997] + "..."
         await update.message.reply_text(preview, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+        if PEXELS_API_KEY:
+            clips = await asyncio.to_thread(search_pexels_videos, niche)
+            if clips:
+                lines = [f"🎬 *{len(clips)} klip video gratis (Pexels) related buat konten ini:*\n"]
+                for i, c in enumerate(clips, 1):
+                    lines.append(f"{i}. {c['duration']}s — {c['url']}")
+                lines.append("\n_Download, gabung urutannya di CapCut sesuai alur caption di atas._")
+                await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
     except Exception as e:
         logger.error(e)
         await loading.edit_text(f"❌ Error: {e}\n\nCoba lagi dengan /buat")
